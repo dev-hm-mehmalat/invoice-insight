@@ -1,22 +1,22 @@
 from flask import Flask, request, jsonify, send_from_directory
-from invoice_utils import process_invoice_text, validate_invoice_data
 from werkzeug.utils import secure_filename
-import pytesseract
 from PIL import Image
+import pytesseract
 import qrcode
 import os
 import sqlite3
 import re
 
-# Flask App initialisieren
+from invoice_utils import process_invoice_text
+
 app = Flask(__name__)
 
-# Upload-Ordner für Dokumente (lokal)
+# Upload-Ordner
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
-# SQLite Datenbank-Verbindung
+# SQLite Datenbankpfad
 DATABASE = 'invoiceinsight.db'
 
 def get_db_connection():
@@ -24,7 +24,6 @@ def get_db_connection():
     conn.row_factory = sqlite3.Row
     return conn
 
-# Datenbank initialisieren (wenn noch nicht vorhanden)
 def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -45,7 +44,29 @@ def init_db():
 
 init_db()
 
-# API-Endpunkt: Hochladen und OCR-Verarbeitung einer Rechnung mit QR-Code-Erzeugung
+# Hilfsfunktionen für Extraktion (Platzhalter)
+def extract_invoice_number(text):
+    # Beispiel-RegEx, anpassen je nach Rechnungsformat
+    match = re.search(r'Rechnung\s*Nr\.?\s*[:\-]?\s*(\S+)', text, re.IGNORECASE)
+    return match.group(1) if match else None
+
+def extract_invoice_date(text):
+    # Beispiel-RegEx für Datum (dd.mm.yyyy)
+    match = re.search(r'(\d{2}\.\d{2}\.\d{4})', text)
+    return match.group(1) if match else None
+
+def extract_total_amount(text):
+    # Beispiel-RegEx für Betrag, z.B. 1234,56 oder 1.234,56
+    match = re.search(r'Gesamt(?:betrag)?\s*[:\-]?\s*([\d\.,]+)', text, re.IGNORECASE)
+    if match:
+        amount_str = match.group(1).replace('.', '').replace(',', '.')
+        try:
+            return float(amount_str)
+        except ValueError:
+            return None
+    return None
+
+# API-Endpunkt: Rechnung hochladen und verarbeiten
 @app.route('/api/invoice/upload', methods=['POST'])
 def upload_invoice():
     if 'file' not in request.files:
@@ -58,36 +79,41 @@ def upload_invoice():
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(filepath)
 
-    # OCR mit pytesseract auf der Datei ausführen
     try:
         img = Image.open(filepath)
-        raw_text = pytesseract.image_to_string(img, lang='deu+eng')  # Deutsch + Englisch
+        raw_text = pytesseract.image_to_string(img, lang='deu+eng')
     except Exception as e:
         return jsonify({'error': f'OCR fehlgeschlagen: {str(e)}'}), 500
 
-    # Daten extrahieren und validieren
-    invoice_data = process_invoice_text(raw_text)
-    validation_errors = validate_invoice_data(invoice_data)
+    invoice_number = extract_invoice_number(raw_text)
+    invoice_date = extract_invoice_date(raw_text)
+    total_amount = extract_total_amount(raw_text)
 
-    if validation_errors:
-        return jsonify({'errors': validation_errors}), 400
+    # Optional: Validierung (hier kannst du eigene Logik ergänzen)
+    errors = []
+    if not invoice_number:
+        errors.append('Rechnungsnummer nicht gefunden.')
+    if not invoice_date:
+        errors.append('Rechnungsdatum nicht gefunden.')
+    if not total_amount:
+        errors.append('Gesamtbetrag nicht gefunden.')
 
-    # QR-Code Inhalt (JSON-artiger String mit wichtigen Feldern)
+    if errors:
+        return jsonify({'errors': errors}), 400
+
+    # QR-Code generieren
     qr_content = {
-        'invoice_number': invoice_data.get('invoice_number'),
-        'invoice_date': str(invoice_data.get('invoice_date')),
-        'total_amount': invoice_data.get('total_amount'),
-        'supplier': invoice_data.get('supplier')
+        'invoice_number': invoice_number,
+        'invoice_date': invoice_date,
+        'total_amount': total_amount
     }
     qr_data_str = str(qr_content)
-
-    # QR-Code generieren und speichern
     qr_img = qrcode.make(qr_data_str)
     qr_filename = f"qr_{os.path.splitext(filename)[0]}.png"
     qr_filepath = os.path.join(app.config['UPLOAD_FOLDER'], qr_filename)
     qr_img.save(qr_filepath)
 
-    # Daten in DB speichern, inkl. QR-Code-Daten
+    # In DB speichern
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute('''
@@ -95,11 +121,11 @@ def upload_invoice():
         VALUES (?, ?, ?, ?, ?, ?, ?)
     ''', (
         filename,
-        invoice_data.get('invoice_number'),
-        invoice_data.get('invoice_date'),
-        invoice_data.get('total_amount'),
-        invoice_data.get('tax_rate'),
-        invoice_data.get('supplier'),
+        invoice_number,
+        invoice_date,
+        total_amount,
+        None,  # tax_rate (kann später ergänzt werden)
+        None,  # supplier (kann später ergänzt werden)
         raw_text
     ))
     conn.commit()
@@ -109,18 +135,18 @@ def upload_invoice():
     return jsonify({
         'message': 'Rechnung erfolgreich verarbeitet',
         'invoice_id': invoice_id,
-        'invoice_number': invoice_data.get('invoice_number'),
-        'invoice_date': invoice_data.get('invoice_date'),
-        'total_amount': invoice_data.get('total_amount'),
+        'invoice_number': invoice_number,
+        'invoice_date': invoice_date,
+        'total_amount': total_amount,
         'qr_code_url': f'/api/invoice/qr/{qr_filename}'
     }), 201
 
-# Endpoint zum Abrufen des QR-Code-Bildes
+# QR-Code abrufen
 @app.route('/api/invoice/qr/<filename>', methods=['GET'])
 def get_qr_code(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
-# API-Endpunkt: Liste aller Rechnungen anzeigen
+# Liste aller Rechnungen
 @app.route('/api/invoices', methods=['GET'])
 def list_invoices():
     conn = get_db_connection()
@@ -137,7 +163,17 @@ def list_invoices():
         })
     return jsonify(result)
 
-# Einfacher Test-Endpoint, um zu prüfen, ob die API läuft
+# Einzelne Rechnung abrufen
+@app.route('/api/invoice/<int:invoice_id>', methods=['GET'])
+def get_invoice(invoice_id):
+    conn = get_db_connection()
+    invoice = conn.execute('SELECT * FROM invoices WHERE id = ?', (invoice_id,)).fetchone()
+    conn.close()
+    if invoice is None:
+        return jsonify({'error': 'Rechnung nicht gefunden'}), 404
+    return jsonify(dict(invoice))
+
+# Test-Endpoint
 @app.route('/api/test', methods=['GET'])
 def api_test():
     return jsonify({
@@ -150,20 +186,10 @@ def api_test():
         }
     })
 
-# Root-Route separat, nicht eingerückt
+# Root-Route
 @app.route('/')
 def index():
     return "InvoiceInsight API läuft! Benutze /api/test, um die API zu testen."
 
-@app.route('/api/invoice/<int:invoice_id>', methods=['GET'])
-def get_invoice(invoice_id):
-    conn = get_db_connection()
-    invoice = conn.execute('SELECT * FROM invoices WHERE id = ?', (invoice_id,)).fetchone()
-    conn.close()
-    if invoice is None:
-        return jsonify({'error': 'Rechnung nicht gefunden'}), 404
-    return jsonify(dict(invoice))
-
-# Startpunkt für lokalen Test
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5001)
