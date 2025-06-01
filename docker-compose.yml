@@ -1,0 +1,9 @@
+version: "3.9"
+services:
+  invoiceinsight:
+    image: invoiceinsight
+    build: .
+    ports:
+      - "5002:5001"  # Ändere den Host-Port auf 5002 (z.B.)
+    volumes:
+      - ./uploads:/app/uploads
